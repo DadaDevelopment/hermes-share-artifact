@@ -7,3 +7,8 @@ platforms:
   - linux
   - macos
   - windows
+provides_tools:
+  - publish_artifact
+  - publish_html
+  - publish_markdown
+  - delete_artifact
