@@ -1,0 +1,9 @@
+name: share-artifact
+version: 0.1.0
+description: "Publish an HTML/Markdown/file artifact to a public URL (Claude-Code-style shared artifacts) and get back a shareable link anyone can open."
+author: DadaDevelopment
+kind: standalone
+platforms:
+  - linux
+  - macos
+  - windows
