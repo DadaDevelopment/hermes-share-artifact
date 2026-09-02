@@ -1,7 +1,7 @@
 ---
 name: share-artifact
 description: "Use when a result should be shown as a standalone web page (HTML report, dashboard, rendered doc) instead of pasted into chat - publish it and hand back a public link."
-version: 0.1.0
+version: 0.2.0
 author: DadaDevelopment
 license: MIT
 metadata:
@@ -29,8 +29,9 @@ it and hand back a link, the way Claude Code's Artifacts feature works.
 
 - Small snippets, code diffs, short answers - just reply normally.
 - Files the user explicitly wants to keep private / local only.
-- Anything with secrets or credentials in it - this publishes PUBLICLY, no
-  auth. Never publish credential dumps, internal-only data, or PII.
+- Anything with secrets or credentials in it - this publishes PUBLICLY (the
+  URL itself is the only access control, no login). Never publish
+  credential dumps, internal-only data, or PII.
 
 ## Tools
 
@@ -42,9 +43,10 @@ it and hand back a link, the way Claude Code's Artifacts feature works.
 - `publish_markdown(markdown, title?)` - publish Markdown, auto-rendered
   with GitHub styling.
 - `delete_artifact(artifact_id)` - take a previously published artifact down.
+- `list_artifacts()` - list what's been published in this profile.
 
-All three publish tools return a public URL immediately (no polling, no
-build step) plus an `artifact_id` for later deletion.
+All publish tools return a public URL immediately (no polling, no build
+step, no git push) plus an `artifact_id` for later deletion.
 
 ## Workflow
 
@@ -58,31 +60,49 @@ build step) plus an `artifact_id` for later deletion.
 
 Example:
 
-    User: "Сделай мне интерактивный HTML-дашборд по этим CSV"
+    User: "Sdelay mne interaktivnyy HTML-dashboard po etim CSV"
     -> write /tmp/report/index.html (+ assets/ if needed)
     -> publish_artifact(path="/tmp/report", title="Sales dashboard")
-    -> reply: "Готово: https://dadadevelopment.github.io/hermes-artifacts/a/7f2a9c1b3e/"
+    -> reply: "Gotovo: https://harness.dada-tuda.ru/share/artifact/a1b2c3d4e5f6/9f8e7d.../"
 
 ## How it works (for reference, not required reading to use it)
 
-Storage is a GitHub repo's `gh-pages` branch
-(`DadaDevelopment/hermes-artifacts` by default), one directory per artifact
-under `a/<id>/`, served for free by GitHub Pages. Publishing = git clone/
-pull + copy files + commit + push; no server to run, no bucket to own. Push
-races (two publishes at once) are handled by fetch+reset+retry - safe
-because each artifact gets its own directory.
+Storage is the LOCAL FILESYSTEM under this plugin's profile-scoped data
+directory - nothing is ever pushed anywhere. Publishing = write files to
+disk + compute an HMAC signature over a random id. A small stdlib HTTP
+server binds `127.0.0.1:<port>` (default 8791) and serves
+`/share/artifact/<id>/<sign>/...`; whatever reverse proxy already
+terminates public TLS for this Hermes instance (Caddy/nginx) forwards that
+one path prefix to it. The signature is the access control: holding the
+full URL is what grants viewing; ids/signs are not guessable or
+enumerable, and there is no directory listing.
 
-Point it at your own repo instead of the default by setting, in
-`config.yaml`:
+Nothing here talks to git, GitHub, or any external service. Deleting an
+artifact removes its directory from disk; the URL 404s immediately after.
+
+## One-time reverse-proxy setup (operator, not the agent)
+
+Add ONE route to the proxy in front of this Hermes instance forwarding
+`/share/artifact/*` to `127.0.0.1:<port>` (same port as
+`plugins.entries.share-artifact.settings.port`, default 8791). Example for
+Caddy:
+
+    handle_path /share/artifact/* {
+        reverse_proxy 127.0.0.1:8791
+    }
+
+Reload the proxy after adding it. The plugin's server binds loopback-only
+by design - it is never exposed directly, only through the proxy that
+already owns the box's public hostname and TLS.
+
+## Config (optional; all have sane defaults)
 
     plugins:
       entries:
         share-artifact:
           settings:
-            repo: "your-org/your-artifacts-repo"
-            branch: "gh-pages"
-            base_url: "https://your-org.github.io/your-artifacts-repo/"
+            port: 8791
+            base_url: "https://harness.dada-tuda.ru"
 
-The target repo's `gh-pages` branch must already exist with GitHub Pages
-enabled on it (`gh api -X PUT repos/<owner>/<repo>/pages -f "source[branch]=gh-pages" -f "source[path]=/"`),
-and the machine running Hermes needs git push access to it.
+`base_url` defaults to `HERMES_DASHBOARD_PUBLIC_URL` if set (which it
+already is on any instance with a public dashboard URL configured).

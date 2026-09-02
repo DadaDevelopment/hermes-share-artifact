@@ -12,3 +12,4 @@ provides_tools:
   - publish_html
   - publish_markdown
   - delete_artifact
+  - list_artifacts

@@ -1,26 +1,33 @@
 """
 share-artifact plugin for Hermes Agent.
 
-Registers three tools in the ``share-artifact`` toolset:
+Registers three publish tools + one delete tool in the ``share-artifact``
+toolset, and starts a small local HTTP server (127.0.0.1-only) that a
+reverse proxy (Caddy/nginx already terminating TLS for this Hermes
+instance) forwards ``/share/artifact/*`` to.
 
-  - publish_artifact(path, title?, entrypoint?)  -> publish a file or directory
-  - publish_html(html, title?)                    -> publish inline HTML
-  - delete_artifact(artifact_id)                  -> remove a published artifact
+Storage: local filesystem, under this plugin's profile-scoped data dir
+(``ctx.state.data_dir``). No git, no repo, no external push - publishing
+is a local file write plus an HMAC signature, nothing leaves the box
+until someone opens the URL.
 
-Storage: a GitHub repo's gh-pages branch, one directory per artifact under
-``a/<id>/``, served by GitHub Pages. No server to run, no S3 bucket to own -
-git push is the publish step and GitHub Pages is the CDN. Public by
-construction: anyone with the URL can view it, no auth.
+URL shape: ``https://<host>/share/artifact/<id>/<sign>/`` - the signature
+(not a login wall) is the access control: holding the full URL is what
+grants viewing, and ids/signs are not guessable or enumerable.
 
-Config (optional, all have defaults suitable for DadaDevelopment/hermes-artifacts)::
+Config (all optional; ``plugins.entries.share-artifact.settings.*`` in
+config.yaml)::
 
     plugins:
       entries:
         share-artifact:
           settings:
-            repo: "DadaDevelopment/hermes-artifacts"
-            branch: "gh-pages"
-            base_url: "https://dadadevelopment.github.io/hermes-artifacts/"
+            port: 8791          # local bind port for the artifact server
+            base_url: "https://harness.dada-tuda.ru"  # public origin
+                                 # (defaults to HERMES_DASHBOARD_PUBLIC_URL)
+
+The HMAC secret is generated once on first use and persisted in this
+plugin's durable state (``ctx.state``) - never in git, never in config.yaml.
 
 Zero core edits - everything goes through the public PluginContext surface
 (``ctx.register_tool``, ``ctx.get_config``, ``ctx.state``).
@@ -29,6 +36,8 @@ Zero core edits - everything goes through the public PluginContext surface
 from __future__ import annotations
 
 import logging
+import os
+import secrets
 from pathlib import Path
 from typing import Any
 
@@ -36,21 +45,52 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["register"]
 
-_DEFAULT_REPO = "DadaDevelopment/hermes-artifacts"
-_DEFAULT_BRANCH = "gh-pages"
-_DEFAULT_BASE_URL = "https://dadadevelopment.github.io/hermes-artifacts/"
+_DEFAULT_PORT = 8791
+_SERVER: "Any" = None  # module-level singleton; see _get_server()
 
 
 def _settings(ctx) -> dict:
     return {
-        "repo": ctx.get_config("repo", _DEFAULT_REPO),
-        "branch": ctx.get_config("branch", _DEFAULT_BRANCH),
-        "base_url": ctx.get_config("base_url", _DEFAULT_BASE_URL),
+        "port": int(ctx.get_config("port", _DEFAULT_PORT) or _DEFAULT_PORT),
+        "base_url": (
+            ctx.get_config("base_url", "")
+            or os.getenv("HERMES_DASHBOARD_PUBLIC_URL", "")
+            or f"http://127.0.0.1:{ctx.get_config('port', _DEFAULT_PORT)}"
+        ).rstrip("/"),
     }
 
 
-def _clone_dir(ctx) -> Path:
-    return ctx.state.data_dir / "repo"
+def _get_secret(ctx) -> str:
+    secret = ctx.state.get("hmac_secret", "")
+    if not secret:
+        secret = secrets.token_hex(32)
+        ctx.state.set("hmac_secret", secret)
+    return secret
+
+
+def _get_store(ctx):
+    from .store import ArtifactStore
+
+    data_dir = ctx.state.data_dir / "artifacts"
+    return ArtifactStore(data_dir, _get_secret(ctx))
+
+
+def _get_server(ctx):
+    global _SERVER
+    from .store import ArtifactServer
+
+    if _SERVER is not None and _SERVER.running:
+        return _SERVER
+    cfg = _settings(ctx)
+    store = _get_store(ctx)
+    _SERVER = ArtifactServer(store, host="127.0.0.1", port=cfg["port"])
+    _SERVER.start()
+    return _SERVER
+
+
+def _public_url(ctx, artifact_id: str, sign: str) -> str:
+    cfg = _settings(ctx)
+    return f"{cfg['base_url']}/share/artifact/{artifact_id}/{sign}/"
 
 
 def _record_artifact(ctx, artifact_id: str, url: str, title: str) -> None:
@@ -62,10 +102,33 @@ def _record_artifact(ctx, artifact_id: str, url: str, title: str) -> None:
         logger.debug("share-artifact: failed to record history", exc_info=True)
 
 
+def _publish_common(ctx, *, path=None, html=None, title="", entrypoint="index.html") -> str:
+    from .store import PublishError
+
+    _get_server(ctx)  # ensure the server is up before handing out a URL
+    store = _get_store(ctx)
+    try:
+        meta = store.publish(path=path, html=html, title=title, entrypoint=entrypoint)
+    except PublishError as e:
+        return f"Error: publish failed - {e}"
+    except Exception as e:
+        logger.warning("share-artifact: publish failed", exc_info=True)
+        return f"Error: publish failed - {e}"
+
+    url = _public_url(ctx, meta["id"], meta["sign"])
+    _record_artifact(ctx, meta["id"], url, meta["title"])
+    return (
+        f"Published: {meta['title']}\n"
+        f"URL: {url}\n"
+        f"Artifact ID: {meta['id']}\n"
+        "Anyone with this URL can view it (public, no login) - the URL "
+        "itself is the access control, so don't paste it anywhere you "
+        "wouldn't paste the content."
+    )
+
+
 def _make_publish_artifact(ctx):
     def _handler(args: dict, **_: Any) -> str:
-        from .publisher import publish, PublishError
-
         raw_path = str(args.get("path") or "").strip()
         if not raw_path:
             return "Error: 'path' is required (file or directory to publish)."
@@ -78,132 +141,69 @@ def _make_publish_artifact(ctx):
         if not path.exists():
             return f"Error: path does not exist: {path}"
 
-        cfg = _settings(ctx)
-        try:
-            result = publish(
-                repo_dir=_clone_dir(ctx),
-                repo=cfg["repo"],
-                branch=cfg["branch"],
-                base_url=cfg["base_url"],
-                path=path,
-                title=title,
-                entrypoint=entrypoint,
-            )
-        except PublishError as e:
-            return f"Error: publish failed - {e}"
-        except Exception as e:
-            logger.warning("share-artifact: publish_artifact failed", exc_info=True)
-            return f"Error: publish failed - {e}"
-
-        _record_artifact(ctx, result.id, result.url, result.title)
-        return (
-            f"Published: {result.title}\n"
-            f"URL: {result.url}\n"
-            f"Artifact ID: {result.id}\n"
-            "Anyone with this URL can view it (public, no login)."
-        )
+        return _publish_common(ctx, path=path, title=title, entrypoint=entrypoint)
 
     return _handler
 
 
 def _make_publish_html(ctx):
     def _handler(args: dict, **_: Any) -> str:
-        from .publisher import publish, PublishError
-
         html = args.get("html")
         if not isinstance(html, str) or not html.strip():
             return "Error: 'html' is required (a non-empty HTML string)."
         title = str(args.get("title") or "").strip()
-
-        cfg = _settings(ctx)
-        try:
-            result = publish(
-                repo_dir=_clone_dir(ctx),
-                repo=cfg["repo"],
-                branch=cfg["branch"],
-                base_url=cfg["base_url"],
-                html=html,
-                title=title,
-            )
-        except PublishError as e:
-            return f"Error: publish failed - {e}"
-        except Exception as e:
-            logger.warning("share-artifact: publish_html failed", exc_info=True)
-            return f"Error: publish failed - {e}"
-
-        _record_artifact(ctx, result.id, result.url, result.title)
-        return (
-            f"Published: {result.title}\n"
-            f"URL: {result.url}\n"
-            f"Artifact ID: {result.id}\n"
-            "Anyone with this URL can view it (public, no login)."
-        )
+        return _publish_common(ctx, html=html, title=title)
 
     return _handler
 
 
 def _make_publish_markdown(ctx):
     def _handler(args: dict, **_: Any) -> str:
-        from .publisher import publish, render_markdown_html, PublishError
+        from .store import render_markdown_html
 
         markdown = args.get("markdown")
         if not isinstance(markdown, str) or not markdown.strip():
             return "Error: 'markdown' is required (a non-empty Markdown string)."
         title = str(args.get("title") or "").strip()
         html = render_markdown_html(markdown, title)
-
-        cfg = _settings(ctx)
-        try:
-            result = publish(
-                repo_dir=_clone_dir(ctx),
-                repo=cfg["repo"],
-                branch=cfg["branch"],
-                base_url=cfg["base_url"],
-                html=html,
-                title=title,
-            )
-        except PublishError as e:
-            return f"Error: publish failed - {e}"
-        except Exception as e:
-            logger.warning("share-artifact: publish_markdown failed", exc_info=True)
-            return f"Error: publish failed - {e}"
-
-        _record_artifact(ctx, result.id, result.url, result.title)
-        return (
-            f"Published: {result.title}\n"
-            f"URL: {result.url}\n"
-            f"Artifact ID: {result.id}\n"
-            "Anyone with this URL can view it (public, no login)."
-        )
+        return _publish_common(ctx, html=html, title=title)
 
     return _handler
 
 
 def _make_delete_artifact(ctx):
     def _handler(args: dict, **_: Any) -> str:
-        from .publisher import delete, PublishError
+        from .store import PublishError
 
         artifact_id = str(args.get("artifact_id") or "").strip()
         if not artifact_id:
             return "Error: 'artifact_id' is required."
 
-        cfg = _settings(ctx)
+        store = _get_store(ctx)
         try:
-            found = delete(
-                repo_dir=_clone_dir(ctx),
-                repo=cfg["repo"],
-                branch=cfg["branch"],
-                artifact_id=artifact_id,
-            )
+            found = store.delete(artifact_id)
         except PublishError as e:
             return f"Error: delete failed - {e}"
         except Exception as e:
-            logger.warning("share-artifact: delete_artifact failed", exc_info=True)
+            logger.warning("share-artifact: delete failed", exc_info=True)
             return f"Error: delete failed - {e}"
 
         if not found:
             return f"No artifact found with id '{artifact_id}'."
         return f"Deleted artifact '{artifact_id}'."
+
+    return _handler
+
+
+def _make_list_artifacts(ctx):
+    def _handler(args: dict | None = None, **_: Any) -> str:
+        history = ctx.state.get("published", [])
+        if not history:
+            return "No artifacts published yet."
+        lines = [f"Published artifacts ({len(history)}):"]
+        for item in history[-50:]:
+            lines.append(f"  - {item.get('id')}: {item.get('title')} -> {item.get('url')}")
+        return "\n".join(lines)
 
     return _handler
 
@@ -224,18 +224,9 @@ _SCHEMAS: dict[str, dict] = {
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Absolute or cwd-relative path to the file or directory to publish.",
-                    },
-                    "title": {
-                        "type": "string",
-                        "description": "Human title for the artifact (used in the returned summary).",
-                    },
-                    "entrypoint": {
-                        "type": "string",
-                        "description": "For directories: which file to serve as the page (default index.html).",
-                    },
+                    "path": {"type": "string", "description": "Absolute or cwd-relative path to the file or directory to publish."},
+                    "title": {"type": "string", "description": "Human title for the artifact."},
+                    "entrypoint": {"type": "string", "description": "For directories: which file to serve as the page (default index.html)."},
                 },
                 "required": ["path"],
             },
@@ -294,6 +285,14 @@ _SCHEMAS: dict[str, dict] = {
             },
         },
     },
+    "list_artifacts": {
+        "type": "function",
+        "function": {
+            "name": "list_artifacts",
+            "description": "List artifacts published in this Hermes profile (id, title, URL).",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
 }
 
 
@@ -332,5 +331,20 @@ def register(ctx) -> None:
             description=_SCHEMAS["delete_artifact"]["function"]["description"],
             emoji="\U0001f5d1",
         )
+        ctx.register_tool(
+            name="list_artifacts",
+            toolset="share-artifact",
+            schema=_SCHEMAS["list_artifacts"],
+            handler=_make_list_artifacts(ctx),
+            description=_SCHEMAS["list_artifacts"]["function"]["description"],
+            emoji="\U0001f4cb",
+        )
     except Exception:
         logger.warning("share-artifact: failed to register tools", exc_info=True)
+
+    # Start the local artifact HTTP server eagerly so the reverse-proxy
+    # route is live even before the first publish call.
+    try:
+        _get_server(ctx)
+    except Exception:
+        logger.warning("share-artifact: failed to start artifact server", exc_info=True)
